@@ -1,4 +1,90 @@
+# vectini-flatnav: high-bandwidth FlatNav
+
+> **Built on FlatNav.** This repository is a research fork of
+> [FlatNav](https://github.com/BlaiseMuhirwa/flatnav) by Blaise Munyampirwa, Vihan Lakshman and
+> Benjamin Coleman ([paper](https://arxiv.org/pdf/2412.01940)). The index, graph construction,
+> distance kernels, Python bindings and everything in the [original README](#flatnav) below are
+> their work, used under the Apache 2.0 license. Please cite their paper (see [Citation](#citation))
+> if you use this code.
+
+### Goal
+
+This fork turns FlatNav into a **single-node, throughput-oriented ANN search engine** and uses it
+to study how search behaves when the index does not all live in fast local memory. The target
+setting is a large index (SIFT100M, 60 GB) served from a multi-tier memory system: local DRAM as a
+fast tier and a slower tier such as remote-socket DRAM or CXL-attached memory. The modifications
+make it possible to:
+
+- **Place the index across memory tiers.** Graph links and vectors are stored separately, so each
+  can be bound to a different NUMA node, and nodes can be reordered so that a chosen "hot" subset
+  lives in the fast tier.
+- **Run high-throughput batch search.** A pool of worker threads is pinned to one node and works
+  through a large query batch, with a lock-free search path for a read-only index.
+- **Instrument the search.** Opt-in hooks record which nodes are visited and how long candidates
+  wait in the queue, to guide placement and prefetching from the fast tier.
+- **Explore compressed-code traversal.** Parts of the search can run on product-quantization (PQ)
+  codes instead of full vectors, to reduce the number of vector reads from the slow tier.
+
+The search algorithm is unchanged unless one of the opt-in macros below is enabled.
+
+### Modifications
+
+**Engine (`include/flatnav/`)**
+
+| Change | Where | What it does |
+|---|---|---|
+| NUMA-aware two-region layout | `util/NumaAllocation.h`, `index/Index.h`, CMake option `FLATNAV_USE_NUMA` | Allocates vectors and graph links as two separate regions, each optionally bound to a NUMA node (via libnuma). Off by default; without it the standard allocator is used. |
+| Pinned worker pool | `util/NumaThreadPool.h` | Runs search work on threads pinned to a given CPU list, so threads stay on the node that holds the data. |
+| Lock-free read-only search | `index/Index.h` | Takes the per-node link mutexes only during construction, not during search on a built index. |
+| Node reordering and fixed entry | `index/Index.h` (`reorderByPermutation`, `setFixedEntryNode`) | Relabels nodes by a given ranking so a hot subset becomes a contiguous prefix that can be bound to the fast tier; optionally starts every query from a fixed entry node. |
+| Virtual destructor on `DistanceInterface` | `distances/DistanceInterface.h` | Ensures distance objects are destroyed correctly through the base-class pointer the index owns. Distance calls still dispatch statically. |
+| **Bug fix:** batched Python search labels | `python-bindings/src/flatnav/bindings.cpp` | Batched `search()` returned `(labels, distances)` into a `(distances, labels)` pair, casting labels to float32. That silently corrupted label ids ≥ 2²⁴ on datasets larger than ~16.7M vectors. |
+
+**Opt-in instrumentation macros** (all compiled out by default)
+
+| Macro | What it enables |
+|---|---|
+| `FLATNAV_DISABLE_PREFETCH` | Turns off FlatNav's software prefetches, for A/B comparisons. |
+| `FLATNAV_PROFILE_VISITS` | Per-node counters of graph-link and vector accesses during search, used to rank nodes by how hot they are. |
+| `FLATNAV_PROFILE_PQ` | Records how long each node stays in the candidate queue between discovery and expansion: the lead time available to a prefetcher. |
+| `FLATNAV_PQ_GATE` | Scores expansions inside a step window `[lo, hi)` with PQ codes instead of full vectors, then rescores the beam exactly at the end of the window. |
+| `FLATNAV_SPEC_TRACE` | Compares the path a PQ-guided search takes inside a window with the path the exact search takes. |
+| `FLATNAV_PROFILE_NOINLINE` | Keeps `processCandidateNode` and the float L2 distance kernel out-of-line so profilers can attribute time to them. |
+
+**Tools and scripts**
+
+| File | Purpose |
+|---|---|
+| `tools/build_sift100m.cpp` | Builds a FlatNav index from a SIFT `.fvecs` base file and a prebuilt HNSW base-layer graph (`.mtx`). |
+| `tools/hbw_search.cpp` | Batch-search benchmark: loads an index, runs queries on N pinned threads, and reports QPS and recall@K per `ef`. |
+| `scripts/bench.sh` | Builds and runs `hbw_search` with configurable vector/graph NUMA placement, thread pinning, `ef` and prefetch; with `PERF=1` it also records DRAM bandwidth, IPC and memory stalls. |
+| `tools/profile_visits.cpp` | Profiles graph-link visit frequency and writes a hot-to-cold node ranking. |
+| `tools/tier_run.cpp` | Ranks nodes by a placement policy (hop distance from a fixed source, or in-degree), reorders the index, binds the hottest fraction to the local NUMA node and the rest to the remote node (`mbind`), then benchmarks search. |
+| `tools/pq_stepgate.cpp`, `scripts/pq_stepgate.sh` | Trains a PQ codebook and sweeps the `FLATNAV_PQ_GATE` window. |
+| `tools/pq_specdiverge.cpp`, `scripts/pq_specdiverge.sh` | Runs the `FLATNAV_SPEC_TRACE` comparison over sliding windows. |
+| `experiments/sift_big_flatnav_recall_batched.py` | Python recall runner, extended with search-batch-size sweeps and recall computed outside the timed region. |
+
+### Running the benchmark
+
+The tools are compiled directly with `g++` (CMake is not needed). For example:
+
+```shell
+# All-local baseline, measure DRAM bandwidth with perf
+PERF=1 ./scripts/bench.sh
+# Graph links on node 0, vectors on node 1
+TAG=graphlocal_vecremote GRAPH_NUMA=0 VECTORS_NUMA=1 PERF=1 ./scripts/bench.sh
+# ef sweep with FlatNav's software prefetch enabled
+EF=40,80,200 PREFETCH=1 ./scripts/bench.sh
+```
+
+`bench.sh` requires `libnuma` and an index built with `tools/build_sift100m.cpp`. Set the index,
+query and ground-truth paths with the `IDX`, `Q` and `GT` environment variables.
+
+---
+
 ## FlatNav 
+
+*The original FlatNav README follows, unchanged.*
 
 FlatNav is a fast and header-only graph-based index for Approximate Nearest Neighbor Search (ANNS). FlatNav is inspired by the influential [Hierarchical Navigable Small World (HNSW) index](https://github.com/nmslib/hnswlib), but with the hierarchical component removed. As detailed in our [research paper](https://arxiv.org/pdf/2412.01940), we found that FlatNav achieved identical performance to HNSW on high-dimensional datasets (dimensionality > 32) with approximately 38% less peak memory consumption and a simplified implementation. 
 
